@@ -8,15 +8,10 @@ on:
         required: true
         type: string
       snapshot:
-        description: '是否为预览版'
+        description: '是否为预览版（不创建Release）'
         required: false
         type: boolean
         default: false
-      create_tag:
-        description: '是否创建新标签'
-        required: false
-        type: boolean
-        default: true
   push:
     tags:
       - "v*"
@@ -32,6 +27,10 @@ on:
   pull_request:
     branches:
       - main
+
+# 添加权限配置
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -73,34 +72,21 @@ jobs:
         with:
           go-version: ^1.25.2
 
-      - name: Check if tag exists
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_tag == true
-        id: check-tag
+      - name: Create tag for manual release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false
         run: |
+          # 检查tag是否已存在
           if git rev-parse "${{ github.event.inputs.version }}" >/dev/null 2>&1; then
-            echo "tag_exists=true" >> $GITHUB_OUTPUT
-            echo "Tag ${{ github.event.inputs.version }} already exists"
+            echo "Tag ${{ github.event.inputs.version }} already exists, skipping creation"
           else
-            echo "tag_exists=false" >> $GITHUB_OUTPUT
-            echo "Tag ${{ github.event.inputs.version }} does not exist"
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git tag -a "${{ github.event.inputs.version }}" -m "Release ${{ github.event.inputs.version }}"
+            git push origin "${{ github.event.inputs.version }}"
           fi
 
-      - name: Create tag for manual release
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_tag == true && steps.check-tag.outputs.tag_exists == 'false'
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git tag -a "${{ github.event.inputs.version }}" -m "Release ${{ github.event.inputs.version }}"
-          git push origin "${{ github.event.inputs.version }}"
-
-      - name: Checkout specific tag
-        if: github.event_name == 'workflow_dispatch' && steps.check-tag.outputs.tag_exists == 'true'
-        run: |
-          git fetch --tags
-          git checkout "${{ github.event.inputs.version }}"
-
-      - name: Build Test
-        if: (github.event_name != 'push' || !contains(github.ref, 'refs/tags/')) && (github.event_name != 'workflow_dispatch' || github.event.inputs.snapshot == true)
+      - name: Build Snapshot
+        if: github.event.inputs.snapshot == true || (github.event_name != 'push' || !contains(github.ref, 'refs/tags/'))
         uses: goreleaser/goreleaser-action@v6
         env:
           GOOS: ${{ matrix.goos }}
@@ -111,8 +97,8 @@ jobs:
           version: "~> v2"
           args: build --single-target --clean --skip=validate --snapshot
 
-      - name: Build
-        if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false)
+      - name: Build Release
+        if: github.event.inputs.snapshot == false && (github.event_name == 'push' && contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
         uses: goreleaser/goreleaser-action@v6
         env:
           GOOS: ${{ matrix.goos }}
@@ -138,9 +124,11 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false)
     needs: build
     name: Release
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -149,6 +137,37 @@ jobs:
 
       - name: Checksum
         run: sha256sum ./assets/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
+
+      - name: Delete existing release if exists
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        env:
+          TAG_NAME: ${{ github.event.inputs.version }}
+        with:
+          script: |
+            const tagName = process.env.TAG_NAME;
+            try {
+              const release = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tagName
+              });
+              if (release.data) {
+                console.log(`Deleting existing release for tag: ${tagName}`);
+                await github.rest.repos.deleteRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: release.data.id
+                });
+                console.log('Existing release deleted successfully');
+              }
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(`No existing release found for tag: ${tagName}`);
+              } else {
+                console.log(`Error checking release: ${error.message}`);
+              }
+            }
 
       - name: Release
         uses: ncipollo/release-action@v1
