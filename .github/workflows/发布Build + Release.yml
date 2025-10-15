@@ -1,0 +1,180 @@
+name: 发布Build + Release
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+    paths-ignore:
+      - ".github/workflows/agent.yml"
+      - ".github/workflows/codeql-analysis.yml"
+      - ".github/workflows/test.yml"
+      - ".github/workflows/contributors.yml"
+      - "README.md"
+      - ".goreleaser.yml"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [linux, windows, darwin, freebsd]
+        goarch: [amd64, arm64, 386]
+        include:
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: s390x
+          - goos: linux
+            goarch: riscv64
+          - goos: linux
+            goarch: arm
+          - goos: linux
+            goarch: mips
+            gomips: softfloat
+          - goos: linux
+            goarch: mipsle
+            gomips: softfloat
+          - goos: freebsd
+            goarch: arm
+        exclude:
+          - goos: darwin
+            goarch: 386
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25.2
+
+      - name: Build Test
+        if: github.event_name != 'push' || !contains(github.ref, 'refs/tags/')
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate --snapshot
+
+      - name: Build
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: zip -jr dist/nezha-agent_${GOOS}_${GOARCH}.zip dist/*/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            ./dist/nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+
+  release:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    needs: build
+    name: Create Release with Full Changelog
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GHCR_PAT }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./assets
+
+      - name: Generate checksums
+        run: |
+          find ./assets -name "*.zip" -exec sha256sum {} \; | awk -F" |/" '{print $1, $NF}' > checksums.txt
+          echo "Generated checksums:"
+          cat checksums.txt
+
+      - name: Generate full changelog
+        id: changelog
+        run: |
+          # 获取当前tag和前一个tag
+          CURRENT_TAG="${{ github.ref_name }}"
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "$CURRENT_TAG"^ 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          
+          echo "Current tag: $CURRENT_TAG"
+          echo "Previous tag: $PREVIOUS_TAG"
+          
+          # 生成详细的变更日志
+          if [ "$PREVIOUS_TAG" != "$CURRENT_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s (%h) by %an" "$PREVIOUS_TAG".."$CURRENT_TAG")
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s (%h) by %an" -n 50)
+          fi
+          
+          # 构建完整的release body
+          RELEASE_BODY="## Full Changelog
+          
+### What's Changed
+$CHANGELOG
+
+### Downloads
+Artifacts are available for multiple platforms. See Assets section below.
+
+### Checksums
+\`\`\`
+$(cat checksums.txt)
+\`\`\`"
+
+          # 将release body保存到文件
+          echo "$RELEASE_BODY" > release_body.md
+          
+          # 设置输出
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$RELEASE_BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body_path: release_body.md
+          files: |
+            checksums.txt
+            assets/*/*.zip
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GHCR_PAT }}
+
+      - name: Trigger sync workflow
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          echo "Waiting for release to complete..."
+          sleep 10
+          echo "Triggering sync workflow..."
+          gh workflow run sync-release.yml --ref ${{ github.ref }}
