@@ -1,28 +1,15 @@
 name: 同步Sync Code to Gitee
 
 on:
-  workflow_dispatch:
-    inputs:
-      source_branch:
-        description: '源分支（GitHub）'
-        required: true
-        default: 'main'
-        type: choice
-        options:
-        - main
-        - master
-        - develop
+  workflow_dispatch:    # 仅手动触发
 
 jobs:
   sync-code-to-gitee:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.source_branch }}  # 根据输入切换源分支
-      
       - uses: adambirds/sync-github-to-gitlab-action@v1.1.0
         with:
           destination_repository: git@gitee.com:hashgopeed/agent.git
-          destination_branch_name: master    # 目标分支固定为 master
+          destination_branch_name: main
           destination_ssh_key: ${{ secrets.GITEE_SSH_KEY }}
