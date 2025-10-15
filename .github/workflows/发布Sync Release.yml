@@ -1,0 +1,49 @@
+name: 发布Sync Release
+
+on:
+  workflow_dispatch:  # 允许手动触发
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    name: Sync release assets
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25.2
+
+      - name: Get latest release info
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            const latestRelease = releases[0];
+            return {
+              tag_name: latestRelease.tag_name,
+              id: latestRelease.id,
+              assets: latestRelease.assets
+            };
+
+      - name: Sync to other registry or platform
+        run: |
+          echo "Syncing release ${{ steps.release.outputs.tag_name }}"
+          # 这里添加您的同步逻辑，例如：
+          # - 同步到 Docker Hub
+          # - 同步到其他包管理器
+          # - 同步到镜像仓库
+          # - 更新文档网站
+          
+          # 示例：打印发布信息
+          echo "Release ID: ${{ steps.release.outputs.id }}"
+          echo "Tag: ${{ steps.release.outputs.tag_name }}"
