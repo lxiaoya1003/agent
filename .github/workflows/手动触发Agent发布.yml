@@ -1,0 +1,185 @@
+name: 手动触发Agent发布
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      version:
+        description: '发布版本号 (例如: v1.0.0)'
+        required: true
+        type: string
+      snapshot:
+        description: '是否为预览版（不创建Release）'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+    paths-ignore:
+      - ".github/workflows/agent.yml"
+      - ".github/workflows/codeql-analysis.yml"
+      - ".github/workflows/test.yml"
+      - ".github/workflows/contributors.yml"
+      - "README.md"
+      - ".goreleaser.yml"
+  pull_request:
+    branches:
+      - main
+
+# 添加权限配置
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [linux, windows, darwin, freebsd]
+        goarch: [amd64, arm64, 386]
+        include:
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: s390x
+          - goos: linux
+            goarch: riscv64
+          - goos: linux
+            goarch: arm
+          - goos: linux
+            goarch: mips
+            gomips: softfloat
+          - goos: linux
+            goarch: mipsle
+            gomips: softfloat
+          - goos: freebsd
+            goarch: arm
+        exclude:
+          - goos: darwin
+            goarch: 386
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25.2
+
+      - name: Create tag for manual release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false
+        run: |
+          # 检查tag是否已存在
+          if git rev-parse "${{ github.event.inputs.version }}" >/dev/null 2>&1; then
+            echo "Tag ${{ github.event.inputs.version }} already exists, skipping creation"
+          else
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git tag -a "${{ github.event.inputs.version }}" -m "Release ${{ github.event.inputs.version }}"
+            git push origin "${{ github.event.inputs.version }}"
+          fi
+
+      - name: Build Snapshot
+        if: github.event.inputs.snapshot == true || (github.event_name != 'push' || !contains(github.ref, 'refs/tags/'))
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate --snapshot
+
+      - name: Build Release
+        if: github.event.inputs.snapshot == false && (github.event_name == 'push' && contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: zip -jr dist/nezha-agent_${GOOS}_${GOARCH}.zip dist/*/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            ./dist/nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+
+  release:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false)
+    needs: build
+    name: Release
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./assets
+
+      - name: Checksum
+        run: sha256sum ./assets/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
+
+      - name: Delete existing release if exists
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        env:
+          TAG_NAME: ${{ github.event.inputs.version }}
+        with:
+          script: |
+            const tagName = process.env.TAG_NAME;
+            try {
+              const release = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tagName
+              });
+              if (release.data) {
+                console.log(`Deleting existing release for tag: ${tagName}`);
+                await github.rest.repos.deleteRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: release.data.id
+                });
+                console.log('Existing release deleted successfully');
+              }
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(`No existing release found for tag: ${tagName}`);
+              } else {
+                console.log(`Error checking release: ${error.message}`);
+              }
+            }
+
+      - name: Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "checksums.txt,assets/*/*.zip"
+          generateReleaseNotes: true
+          update: true
+          tag: ${{ github.event.inputs.version || github.ref_name }}
+
+      - name: Trigger sync
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run sync-release.yml
