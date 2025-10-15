@@ -1,42 +1,78 @@
-name: 测试Release
+name: 测试Build + Release
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:  # 允许手动触发
+    branches:
+      - main
+    paths-ignore:
+      - ".github/workflows/agent.yml"
+      - ".github/workflows/codeql-analysis.yml"
+      - ".github/workflows/test.yml"
+      - ".github/workflows/contributors.yml"
+      - "README.md"
+      - ".goreleaser.yml"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:  # 手动触发支持
 
 jobs:
-  goreleaser:
+  # 测试构建（用于 PR 和分支推送）
+  test-build:
+    if: github.event_name != 'push' || !contains(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: ^1.25.2
+
+      - name: Run GoReleaser snapshot
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --clean --snapshot
+
+  # 正式发布（仅用于标签推送）
+  release:
+    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 必需，用于创建 releases
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GHCR_PAT }}  # 使用您的 PAT 来 checkout
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25.2
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v5
+        uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: "~> v2"
           args: release --clean
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 使用您的 GHCR_PAT 作为 GitHub Token
+          GITHUB_TOKEN: ${{ secrets.GHCR_PAT }}
 
-  sync-release:
-    runs-on: ubuntu-latest
-    needs: goreleaser
-    if: success()
-    steps:
-      - name: Trigger external sync
+      - name: Trigger sync workflow
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
         run: |
-          echo "Release completed, ready for external sync"
+          echo "Waiting for release to complete..."
+          sleep 30
+          echo "Triggering sync workflow..."
+          gh workflow run sync-release.yml --ref ${{ github.ref }}
