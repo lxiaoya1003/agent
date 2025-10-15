@@ -1,0 +1,192 @@
+name: 完全Agent发布
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号 (例如: v1.0.0)'
+        required: true
+        type: string
+      create_release:
+        description: '创建 GitHub Release'
+        required: true
+        type: boolean
+        default: true
+      overwrite_release:
+        description: '覆盖已存在的Release'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    name: Create Release
+    outputs:
+      release_tag: ${{ steps.set-tag.outputs.tag }}
+      release_exists: ${{ steps.check-release.outputs.exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set release tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+          echo "Release tag: ${{ steps.set-tag.outputs.tag }}"
+
+      - name: Check if release exists
+        id: check-release
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set-tag.outputs.tag }}" || echo "{}")
+          if echo "$RESPONSE" | grep -q '"message":"Not Found"'; then
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release ${{ steps.set-tag.outputs.tag }} already exists"
+          fi
+
+      - name: Delete existing release
+        if: steps.check-release.outputs.exists == 'true' && (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+        run: |
+          echo "Deleting existing release ${{ steps.set-tag.outputs.tag }}..."
+          curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set-tag.outputs.tag }}" || echo "Failed to delete release, continuing..."
+          sleep 2
+
+      - name: Create Release
+        if: steps.check-release.outputs.exists == 'false' || (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set-tag.outputs.tag }}
+          name: Release ${{ steps.set-tag.outputs.tag }}
+          body: |
+            Nezha Agent 版本 ${{ steps.set-tag.outputs.tag }}
+            
+            ### 支持平台
+            - Linux (amd64, arm64, 386, arm, s390x, riscv64, mips, mipsle)
+            - Windows (amd64, arm64, 386)
+            - Darwin (amd64, arm64)
+            - FreeBSD (amd64, arm64, 386, arm)
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, windows, darwin, freebsd]
+        goarch: [amd64, arm64, 386]
+        include:
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: s390x
+          - goos: linux
+            goarch: riscv64
+          - goos: linux
+            goarch: arm
+          - goos: linux
+            goarch: mips
+            gomips: softfloat
+          - goos: linux
+            goarch: mipsle
+            gomips: softfloat
+          - goos: freebsd
+            goarch: arm
+        exclude:
+          - goos: darwin
+            goarch: 386
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25.2
+
+      - name: Build Release
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Archive binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          # 创建干净的压缩包名称
+          cd dist
+          for dir in */; do
+            if [ -f "$dir/nezha-agent" ] || [ -f "$dir/nezha-agent.exe" ]; then
+              zip -jr "../nezha-agent_${GOOS}_${GOARCH}.zip" "$dir"/*
+              echo "Created: nezha-agent_${GOOS}_${GOARCH}.zip"
+            fi
+          done
+          cd ..
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nezha-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+
+  upload-assets:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    if: needs.create-release.outputs.release_exists == 'false' || (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+    name: Upload Release Assets
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Prepare release assets
+        run: |
+          echo "准备发布资源..."
+          mkdir -p release-assets
+          
+          # 复制所有 zip 文件到统一目录
+          find artifacts -name "*.zip" -exec cp {} release-assets/ \;
+          
+          # 创建校验和文件
+          cd release-assets
+          sha256sum *.zip > checksums.txt
+          cd ..
+          
+          echo "发布的文件:"
+          ls -la release-assets/
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.create-release.outputs.release_tag }}
+          files: |
+            release-assets/checksums.txt
+            release-assets/*.zip
