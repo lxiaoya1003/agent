@@ -1,178 +1,81 @@
-import os
-import time
-import requests
 import hashlib
+import os
+from pathlib import Path
+
+import requests
 from github import Github
 
+SOURCE_REPOSITORY = "lxiaoya1003/agent"
+GITEE_OWNER = "hashgopeed"
+GITEE_REPOSITORY = "agent"
 
-def get_github_latest_release():
-    g = Github()
-    repo = g.get_repo("nezhahq/agent")
-    release = repo.get_latest_release()
-    if release:
-        print(f"Latest release tag is: {release.tag_name}")
-        print(f"Latest release info is: {release.body}")
-        files = []
-        for asset in release.get_assets():
-            url = asset.browser_download_url
-            name = asset.name
 
-            response = requests.get(url)
-            if response.status_code == 200:
-                with open(name, 'wb') as f:
-                    f.write(response.content)
-                print(f"Downloaded {name}")
-            else:
-                print(f"Failed to download {name}")
-            file_abs_path = get_abs_path(asset.name)
-            files.append(file_abs_path)
-        print('Checking file integrities')
-        verify_checksum(get_abs_path("checksums.txt"))
-        sync_to_gitee(release.tag_name, release.body, files)
+def download_latest_release():
+    github_token = os.getenv("GITHUB_TOKEN")
+    github = Github(github_token) if github_token else Github()
+    release = github.get_repo(SOURCE_REPOSITORY).get_latest_release()
+    files = []
+    for asset in release.get_assets():
+        path = Path(asset.name)
+        response = requests.get(asset.browser_download_url, timeout=120)
+        response.raise_for_status()
+        path.write_bytes(response.content)
+        files.append(path)
+        print(f"Downloaded {path.name}")
+    checksum_file = Path("checksums.txt")
+    if checksum_file.exists():
+        verify_checksum(checksum_file)
     else:
-        print("No releases found.")
+        print("checksums.txt not found; skipping checksum verification")
+    return release, files
 
 
-def delete_gitee_releases(latest_id, client, uri, token):
-    get_data = {
-        'access_token': token
+def verify_checksum(checksum_file):
+    for line in checksum_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        expected, name = line.split(maxsplit=1)
+        path = Path(name.strip().lstrip("*"))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            raise RuntimeError(f"checksum mismatch: {path.name}")
+        print(f"{path.name}: OK")
+
+
+def sync_to_gitee(release, files):
+    token = os.environ["GITEE_TOKEN"]
+    base = f"https://gitee.com/api/v5/repos/{GITEE_OWNER}/{GITEE_REPOSITORY}/releases"
+    payload = {
+        "access_token": token,
+        "tag_name": release.tag_name,
+        "name": release.tag_name,
+        "body": release.body or "",
+        "prerelease": release.prerelease,
+        "target_commitish": "main",
     }
-
-    release_info = []
-    release_response = client.get(uri, json=get_data)
-    if release_response.status_code == 200:
-        release_info = release_response.json()
+    response = requests.post(base, json=payload, timeout=60)
+    if response.status_code == 409:
+        existing = requests.get(base, params={"access_token": token}, timeout=60)
+        existing.raise_for_status()
+        matches = [item for item in existing.json() if item.get("tag_name") == release.tag_name]
+        if not matches:
+            raise RuntimeError(f"Gitee release creation failed: {response.status_code} {response.text}")
+        release_id = matches[0]["id"]
+        print(f"Gitee release already exists: {release_id}")
     else:
-        print(
-            f"Request failed with status code {release_response.status_code}")
-
-    release_ids = []
-    for block in release_info:
-        if 'id' in block:
-            release_ids.append(block['id'])
-
-    print(f'Current release ids: {release_ids}')
-    release_ids.remove(latest_id)
-
-    for id in release_ids:
-        release_uri = f"{uri}/{id}"
-        delete_data = {
-            'access_token': token
-        }
-        delete_response = client.delete(release_uri, json=delete_data)
-        if delete_response.status_code == 204:
-            print(f'Successfully deleted release #{id}.')
-        else:
-            raise ValueError(
-                f"Request failed with status code {delete_response.status_code}")
+        response.raise_for_status()
+        release_id = response.json()["id"]
+        print(f"Gitee release created: {release_id}")
+    upload_url = f"{base}/{release_id}/attach_files"
+    for path in files:
+        with path.open("rb") as handle:
+            upload = requests.post(upload_url, params={"access_token": token}, files={"file": handle}, timeout=180)
+        if upload.status_code not in (201, 409):
+            upload.raise_for_status()
+        print(f"Uploaded {path.name}")
 
 
-def sync_to_gitee(tag: str, body: str, files: slice):
-    release_id = ""
-    owner = "naibahq"
-    repo = "agent"
-    release_api_uri = f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases"
-    api_client = requests.Session()
-    api_client.headers.update({
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-    })
-
-    access_token = os.environ['GITEE_TOKEN']
-    release_data = {
-        'access_token': access_token,
-        'tag_name': tag,
-        'name': tag,
-        'body': body,
-        'prerelease': False,
-        'target_commitish': 'main'
-    }
-    while True:
-        try:
-            release_api_response = api_client.post(
-                release_api_uri, json=release_data, timeout=30)
-            release_api_response.raise_for_status()
-            break
-        except requests.exceptions.Timeout as errt:
-            print(f"Request timed out: {errt} Retrying in 60 seconds...")
-            time.sleep(60)
-        except requests.exceptions.RequestException as err:
-            print(f"Request failed: {err}")
-            break
-    if release_api_response.status_code == 201:
-        release_info = release_api_response.json()
-        release_id = release_info.get('id')
-    else:
-        print(
-            f"Request failed with status code {release_api_response.status_code}")
-
-    print(f"Gitee release id: {release_id}")
-    asset_api_uri = f"{release_api_uri}/{release_id}/attach_files"
-
-    for file_path in files:
-        success = False
-
-        while not success:
-            files = {
-                'file': open(file_path, 'rb')
-            }
-
-            asset_api_response = requests.post(
-                asset_api_uri, params={'access_token': access_token}, files=files)
-
-            if asset_api_response.status_code == 201:
-                asset_info = asset_api_response.json()
-                asset_name = asset_info.get('name')
-                print(f"Successfully uploaded {asset_name}!")
-                success = True
-            else:
-                print(
-                    f"Request failed with status code {asset_api_response.status_code}")
-
-    # 仅保留最新 Release 以防超出 Gitee 仓库配额
-    try:
-        delete_gitee_releases(release_id, api_client,
-                              release_api_uri, access_token)
-    except ValueError as e:
-        print(e)
-
-    api_client.close()
-    print("Sync is completed!")
-
-
-def get_abs_path(path: str):
-    wd = os.getcwd()
-    return os.path.join(wd, path)
-
-
-def compute_sha256(file: str):
-    sha256_hash = hashlib.sha256()
-    buf_size = 65536
-    with open(file, 'rb') as f:
-        while True:
-            data = f.read(buf_size)
-            if not data:
-                break
-            sha256_hash.update(data)
-    return sha256_hash.hexdigest()
-
-
-def verify_checksum(checksum_file: str):
-    with open(checksum_file, 'r') as f:
-        lines = f.readlines()
-
-    for line in lines:
-        checksum, file = line.strip().split()
-        abs_path = get_abs_path(file)
-        computed_hash = compute_sha256(abs_path)
-
-        if checksum == computed_hash:
-            print(f"{file}: OK")
-        else:
-            print(f"{file}: FAIL (expected {checksum}, got {computed_hash})")
-            print("Will run the download process again")
-            get_github_latest_release()
-            break
-
-
-get_github_latest_release()
+if __name__ == "__main__":
+    latest_release, release_files = download_latest_release()
+    sync_to_gitee(latest_release, release_files)
+    print("Sync is completed")
